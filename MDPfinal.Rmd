@@ -1,0 +1,1262 @@
+---
+title: "Estudio de la satisfacción y clasificación de clientes de una aerolínea con métodos estadísticos"
+output: pdf_document
+---
+##### AUTORES: Carla Jimenez, Michele Romero, Marta Martinez, Fernanda de Paula Gonçalves, Isaac Gimeno
+##### GRUPO: "B2-01"
+```{r, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, message=FALSE, out.width="60%")
+```
+
+```{r setup, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+library(mice)
+library(FactoMineR)
+library(factoextra)
+library(knitr)
+library(grid)
+library(gridExtra)
+library(ggsci)
+library(cluster)
+library(NbClust)
+library(clValid)
+library(ropls)
+library(viridis)
+library(patchwork)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(caret)
+library(MASS) 
+library(pROC)
+library(corrplot)
+```
+
+
+# Preparación previa de los datos
+
+```{r aero, echo=FALSE}
+aerolinea = read.csv("Aerolinea.csv", stringsAsFactors = TRUE)
+```
+
+Este estudio analiza los perfiles de los clientes de una aerolínea y su nivel de satisfacción basado en el valor de la calificación del servicio, combinado con datos personales como su edad o género. 
+
+El objetivo es encontrar y clasificar a los usuarios con métodos estadísticos para así poder determinar qué es importante para los usuarios en relación con su experiencia de vuelo. En el dataset de Aerolinea hay `r ncol(aerolinea)` variables para `r nrow(aerolinea)` clientes registrados. 
+```{r, echo=FALSE, results='hide'}
+descAero = data.frame("variable" = colnames(aerolinea),
+                      "tipo" = c("categorical", "categorical",      
+                                 rep("numerical", 18),
+                                 "categorical"),
+                      stringsAsFactors = FALSE)
+rownames(descAero) = descAero$variable
+descAero
+
+```
+En este dataset se almacena la información de clientes de una aerolínea, incluidas en 21 variables que explican diferentes aspectos los vuelos. Las variables **Gender**,**Customer**,**Age** ofrecen información sobre género, tipo de cliente (leal o no a la compañía) y la edad del cliente del vuelo respectivamente. 
+Asimismo hay variables que miden la valoración de aspectos específicos de la aerolínea, en una escala del 0-5 y son: **Wifi**(el Wifi en el vuelo), **DepartureAndArrivalTimeConvenient** (la hora de llegada y salida del vuelo), **EaseOnlineBooking** (la facilidad de reserva del vuelo de forma online), **GateLocation** (localización de la puerta de embarque), **FoodDrink** (calidad de la bebida y comida durante el vuelo), **OnlineBoarding** (el embarque con el pase online), **SeatComfort** (la comodidad de los asientos durante el vuelo), **InflightEntertainment** (el entretenimiento a bordo como la calidad de las películas), **OnboardService** (el servicio a bordo el vuelo, desde que se sube el cliente al avión hasta que se baja), **LegRoom** (el espacio para las piernas entre asientos durante el vuelo), **BaggageHandling** (el manejo del equipaje por parte de la tripulación), **Checkin** (el check-in del vuelo), **InflightService** (el servicio durante el vuelo, únicamente desde que el avión está en el aire), **Cleanliness** (la limpieza a bordo).
+
+Por último están **Distance** (distancia total del vuelo en km), **DepartureDelayMin** (tiempo de retraso en la salida del vuelo en minutos), **ArrivalDelayMin** (tiempo de retraso en la llegada del vuelo en minutos) y **Satisfaction** (satisfacción final del vuelo).
+
+
+## Análisis para ver si se excluyen variables
+
+```{r aero2, include=FALSE}
+aero2 = aerolinea
+descAero = descAero[colnames(aero2),]
+table(descAero$tipo)
+
+```
+En este dataset solo hay `r sum(descAero$tipo == "categorical")` variables categóricas, y `r sum(descAero$tipo == "numerical")` variables numéricas.
+
+\begingroup
+\scriptsize
+```{r, results='asis'}
+# Desviación típica
+mySD = apply(aero2[, descAero$variable[descAero$tipo == "numerical"]], 2, sd, na.rm = TRUE)
+# Media
+myMU = colMeans(aero2[, descAero$variable[descAero$tipo == "numerical"]], na.rm = TRUE)
+# Coeficiente de variación
+myCV = mySD / myMU
+
+# Crear tabla
+tabla = data.frame(Variable = names(myCV), Coef_Variacion = myCV)
+
+knitr::kable(tabla[order(tabla$Coef_Variacion), ], digits = 3, row.names = FALSE)
+
+
+```
+\endgroup
+
+Con el análisis del coeficiente de variación de las variables numéricas muestra que no hay variables constantes, ya que ninguna presenta valores cercanos a 0. Sin embargo, las variables ArrivalDelayMin y DepartureDelayMin tienen un CV superior a 2, lo que indica mucha dispersión respecto a su media. Esto se debe a que en muchos vuelos no hay retrasos, mientras que en otros su tiempo es bastante prolongados, lo que genera una variabilidad considerable.
+
+\begingroup
+\scriptsize
+```{r, echo=FALSE}
+apply(aero2[, descAero$variable[descAero$tipo == "categorical"]], 2, table, useNA = "ifany")
+apply(aero2[, descAero$variable[descAero$tipo == "categorical"]], 2,
+       function(x) round(100 * table(x) / sum(table(x)), 2))
+
+```
+\endgroup
+
+El análisis de las variables categóricas muestra que Gender tiene una distribución equilibrada, con casi 50% de cada.Por otro lado, tanto Customer como Satisfaction muestran desequilibrio. En el caso de Customer, el 90% de los clientes son leales ("Loyal Customer"), y alrededor de 10% son desleales ("Disloyal Customer"). Con Satisfaction ocurre algo similar, donde poco más del 75% de los pasajeros se muestran satisfechos con el vuelo ("satisfied") y el resto son neutrales o disatisfechos ("neutral or dissatisfied"). A pesar de este desequilibrio, no se van a eliminar porque sus datos pueden ser útiles para el análisis.
+
+
+## Estudio de datos anómalos e inconsistentes
+
+Para ver si hay algún dato inconsistente en variables categóricas, se estudian gráficamente. Como hay datos que incluyen 0, no se va a hacer una escala logarítmica. Como gran parte de las variables numéricas son una escala del 0-5, se realiza un boxplot para cada una de las variables con esta característica.
+
+```{r}
+boxplot(aero2[, setdiff(descAero$variable[descAero$tipo == "numerical"], 
+                        c("Age", "DepartureDelayMin", "ArrivalDelayMin", "Distance"))],
+        las = 2, col = "pink", 
+        main = "Boxplots sin las variables de retraso, edad y distancia")
+
+```
+
+
+Con este gráfico de caja y bigotes se observa un valor anómalo muy evidente en la variable LegRoom, con un valor de 40. Dado que todas las variables en este gráfico tienen una escala del 0 al 5, es muy probable que se trate de un error de introducción de datos, donde se ha escrito un 40 en lugar de un 4. Este error puede corregirse fácilmente cambiando ese valor incorrecto por el 4. Con este dato corregido, ya se puede analizar más adecuadamente el gráfico en cuestión.
+
+
+```{r}
+aero2$LegRoom[aero2$LegRoom == 40] = 4
+
+```
+
+
+## Valores faltantes
+Ahora se estudia si existen datos faltantes en la base de datos, y si existen, se quieren tratar para poder utilizar esas observaciones en análisis posteriores.
+\begingroup
+\scriptsize
+```{r}
+numNA = apply(aero2, 2, function(x) sum(is.na(x)))
+percNA = round(100 * apply(aero2, 2, function(x) mean(is.na(x))), 2)
+
+tablaNA = data.frame("tipo" = descAero[,-1], numNA, percNA)
+
+tablaNA[tablaNA$numNA > 0, ]
+
+```
+\endgroup
+
+Como ninguna de las variables presenta más del 20% de valores faltantes, no es necesario eliminar ninguna. No obstante, como sí existen variables con datos ausentes, es necesario tratar estos valores.
+
+Como la mayoría presenta únicamente un valor faltante, se ha optado por sustituirlo por su mediana correspodiente. Esta imputación no se realiza con ArrivalDelayMin, ya que contiene varios valores faltantes y no sería apropiado reemplazarlos todos por un solo valor. Para esta variable se realiza la imputación con la librería mice. Con todo esto, se consigue minimizar el cambio de la distribución tras la imputación, como se observa en el **Anexo 1**, manteniendo aquellos datos con datos faltantes, ya que pueden ser útiles para el análisis.
+
+```{r, results='hide'}
+aero3 = aero2
+
+aero3$LegRoom[is.na(aero3$LegRoom)] = median(aero2$LegRoom, na.rm = TRUE)
+aero3$BaggageHandling[is.na(aero3$BaggageHandling)] = median(aero2$BaggageHandling, na.rm = TRUE)
+aero3$Checkin[is.na(aero3$Checkin)] = median(aero2$Checkin, na.rm = TRUE)
+
+```
+
+```{r, include=FALSE}
+
+arrivalImp = mice(aero3, seed = 123, m = 5, print = FALSE)
+
+par(mfrow = c(1, 3))
+mice::stripplot(arrivalImp, ArrivalDelayMin)
+
+# Se ha elegido la matriz imputada 3, ya que presenta una distribución de los datos similar al resto.
+arrivalImp = complete(arrivalImp, 3)
+aero3$ArrivalDelayMin = arrivalImp$ArrivalDelayMin
+
+```
+
+# PCA
+Ahora se aplica el PCA al dataset para así poder agrupar algunas variables y ver las relaciones que hay entre ellas. En este caso el estudio se centrará en la nota que le da el pasajero a los distintos servicios del vuelo. Con esto en mente, aquellas variables que no son puntuaciones se pondrán como suplementarias.
+
+```{r, out.width="50%"}
+
+res.pca <- PCA(aero3, 
+               scale.unit = TRUE, 
+               graph = FALSE, 
+               ncp = 10,
+               quanti.sup = which(names(aero3) %in% c("Distance", "Age", "DepartureDelayMin", "ArrivalDelayMin")),
+               quali.sup = which(descAero$tipo == "categorical"))
+
+eig.val <- get_eigenvalue(res.pca)
+
+VPmedio <- 100 * (1 / nrow(eig.val))
+
+fviz_eig(res.pca, addlabels = TRUE) +
+  geom_hline(yintercept = VPmedio, linetype = 2, color = "red")
+
+K <- 5
+res.pca <- PCA(aero3, scale.unit = TRUE, graph = FALSE, ncp = K,
+               quanti.sup = which(names(aero3) %in% c("Distance", "Age", "DepartureDelayMin", "ArrivalDelayMin")),
+               quali.sup = which(descAero$tipo == "categorical"))
+```
+
+
+Generando el gráfico del codo con 10 componentes se puede extraer el número de componentes principales adecuado para el estudio. Todas aquellas dimensiones que se encuentran por encima de la recta roja son las que se escogen para el estudio.
+
+Por ello se seleccionan `r K` PCs, que explican un `r round(eig.val[K,"cumulative.variance.percent"], 1)`% del total de variabilidad de los datos.
+
+
+## Validación del PCA
+
+### Detección de anómalos con T2-Hotelling
+
+Con ayuda del estadístico $T^2$ de Hotelling se pueden identificar valores anómalos extremos. Se mostrará entonces un gráfico con los valores del $T^2$ utilizando las `r K` Ps seleccionadas e incluyendo los límites de confianza al 95% (naranja) y 99% (rojo). 
+
+```{r, out.width="50%"}
+# Cálculo del estadístico T² de Hotelling
+
+misScores = res.pca$ind$coord[, 1:K]
+miT2 = colSums(t(misScores**2) / eig.val[1:K, 1])
+I = nrow(aero3)
+
+F95 = K*(I**2 - 1)/(I*(I - K)) * qf(0.95, K, I-K)
+F99 = K*(I**2 - 1)/(I*(I - K)) * qf(0.99, K, I-K)
+
+plot(1:length(miT2), miT2, type = "p", xlab = "Clientes", ylab = "T2", 
+     main = "Estadístico T^2 de Hotelling")
+
+abline(h = F95, col = "orange", lty = 2, lwd = 2)
+abline(h = F99, col = "red3", lty = 2, lwd = 2)
+
+anomalas <- which(miT2 > F95)
+
+```
+
+Los datos que se han almacenado en "anomalas" son las observaciones que han superado el umbral $T^2$. Esto quiere decir que hay muchas observaciones atípicas en las componentes principales seleccionadas. Esto se muestra de forma más visual en el gráfico, donde muchos puntos sobrepasan los límites de confianza del 95% y 99%.
+
+En total, hay `r length(anomalas)` clientes que superan el límite del 95%, lo que quiere decir que hay muchos CASOS EXTREMOS, que no siguen el perfil general de los clientes de la aerolínea. A pesar de ello, se decide no eliminar dichas observaciones ya que pueden aportar información útil para el estudio.
+
+```{r}
+contribT2 = function (X, scores, loadings, eigenval, observ, cutoff = 2) {
+  # X is data matrix and must be centered (or centered and scaled if data were scaled)
+  misScoresNorm = t(t(scores**2) / eigenval)
+  misContrib = NULL
+  for (oo in observ) {
+    print(rownames(scores)[oo])
+    print(scores[oo,])
+    misPCs = which(as.numeric(misScoresNorm[oo,]) > cutoff)
+    lacontri = sapply(misPCs, function (cc) (scores[oo,cc]/eigenval[cc])*loadings[,cc]*X[oo,])
+    lacontri = rowSums((1*(sign(lacontri) == 1))*lacontri)
+    misContrib = cbind(misContrib, lacontri)
+  }
+  colnames(misContrib) = rownames(misScoresNorm[observ,])
+  return(misContrib)
+}
+```
+
+```{r, out.width="50%"}
+aeroCE = aero3[,descAero$tipo == "numerical"]
+aeroCE = aeroCE[,setdiff(colnames(aeroCE), c("Distance", "Age", "DepartureDelayMin", "ArrivalDelayMin"))]
+aeroCE = scale(aeroCE, center = TRUE, scale = TRUE)
+
+X = as.matrix(aeroCE)
+misLoadings = sweep(res.pca$var$coord, 2, sqrt(res.pca$eig[1:K, 1]), FUN = "/")
+mycontrisT2 = contribT2(X = X, scores = misScores, loadings = misLoadings, 
+                        eigenval = eig.val[1:K, 1],observ = which.max(miT2), cutoff = 2)
+
+par(mar = c(10, 2.3, 3, 1))
+barplot(mycontrisT2[, 1], las = 2, col = "indianred", main = paste0("Observación: ", which.max(miT2)))
+
+```
+
+
+La observación `r rownames(aero3)[which.max(miT2)]` es la más atípica del estudio, como se muestra en el análisis $T^2$ de Hotelling. Asimismo, el gráfico de barras revela que las variables que más contribuyen a que sea atípica son principalmente Checkin y LegRoom. Al analizar los scores de las primeras `r K` Ps, se aprecia que la dimensión 5 tiene un valor notablemente elevado, mientras que la dimensión 2 presenta un valor muy bajo. Esto quiere decir que la observación `r rownames(aero3)[which.max(miT2)]` está proyectada lejos de la media, en la dirección positiva en el eje de la dimensión 5, y en dirección negativa en el caso de la dimensión 2.
+
+Como tanto el Checkin como el LegRoom pueden ser relevantes para la satisfacción del cliente, se decide no eliminarlas del estudio.
+
+
+### Distancia al modelo (SCR)
+
+A continuación, se estudia la distancia al modelo PCA mediante la Suma de Cuadrados Residual (SCR), con el objetivo de detectar los valores anómalos moderados (las observaciones que no están bien representadas por las PCs del modelo).
+
+```{r, out.width="50%"}
+myE = X - misScores %*% t(misLoadings) 
+mySCR = rowSums(myE^2)  
+plot(1:length(mySCR), mySCR, type = "l", main = "Distancia al modelo", 
+     ylab = "SCR", xlab = "Clientes", ylim = c(0,15))
+g = var(mySCR)/(2*mean(mySCR))
+h = (2*mean(mySCR)^2)/var(mySCR)
+chi2lim = g*qchisq(0.95, df = h)
+chi2lim99 = g*qchisq(0.99, df = h)
+abline(h = chi2lim, col = "orange", lty = 2, lwd = 2)
+abline(h = chi2lim99, col = "red3", lty = 2, lwd = 2)
+```
+
+
+En este caso, hay `r sum(mySCR > chi2lim)` clientes que se salen fuera del límite del 95%, y `r sum(mySCR > chi2lim99)` fuera del límite del 99%. 
+
+En el gráfico se aprecia que la mayor parte de las observaciones tienen SCRs bajas, lo que indica una buena representación. Sin embargo, algunas superan los límites del 95% y 99%, por lo que el modelo no adapta adecuadamente para estas observaciones.
+
+
+## Interpretación del modelo PCA
+### Gráficos de variables
+Como hay un número considerabe de clientes que supera el límite del 99% SCR, se decide eliminarlos del conjunto. Esto se realiza para mejorar la calidad del modelo, evitando que estos casos tan atípicos eviten una buena interpretación del modelo.
+
+```{r, out.width="50%"}
+aero4 = aero3[-which(mySCR > chi2lim99), ]
+res.pca <- PCA(aero4, scale.unit = TRUE, graph = FALSE, ncp = K,
+               quanti.sup = which(names(aero3) %in% c("Distance", "Age", "DepartureDelayMin", "ArrivalDelayMin")),
+               quali.sup = which(descAero$tipo == "categorical"))
+
+
+p1 = fviz_pca_var(res.pca, axes = c(1, 2), repel = TRUE, col.var = "contrib",
+             gradient.cols = c("pink", "purple", "darkred"))
+
+
+p2 = fviz_pca_var(res.pca, axes = c(2, 3), repel = TRUE, col.var = "contrib",
+             gradient.cols = c("pink", "purple", "darkred"))
+
+
+p3 = fviz_pca_var(res.pca, axes = c(1, 4), repel = TRUE, col.var = "contrib",
+              gradient.cols = c("pink", "purple", "darkred"))
+
+p4 = fviz_pca_var(res.pca, axes = c(1, 5), repel = TRUE, col.var = "contrib",
+             gradient.cols = c("pink", "purple", "darkred"))
+
+grid.arrange(p1, p2, ncol = 2) # mostrar 2 a 2
+grid.arrange(p3, p4, ncol = 2)
+
+```
+
+
+En los gráficos de loadings, las variables coloreadas en azul corresponden a las variables auxiliares numéricas. 
+
+Respecto a la dimensión 1, a primera vista se observa que esta agrupa variables como Cleanliness, FoodDrink, SeatComfort e InflightEntertainment, que muestran una alta contribución y se proyectan en la misma dirección, por lo que esta dimensión agrupa la satisfacción con las cualidades físicas en el avión.
+
+En el caso de la dimensión 2, esta está más asociada a la calidad del servicio ofrecido por la tripulación, donde se relacionan variables como BaggageHandling, InflightService y OnboardService.
+
+En lo que respecta a la dimensión 3, se reúnen las variables OnlineBoarding, EaseOnlineBooking y GateLocation, que son aquellas asociadas a la experiencia previa al embarque.
+
+Finalmente, en la dimensión 4 se representan las variables GateLocation y DepartureAndArrivalTimeConvenient, que son factores relacionados con la organización de la aerolínea.
+
+- **Dimensión 1:** satisfacción con las cualidades físicas en el avión.
+- **Dimensión 2:** calidad del servicio ofrecido por la tripulación.
+- **Dimensión 3:** experiencia previa al embarque.
+- **Dimensión 4:** factores relacionados con la organización de la aerolínea.
+
+
+# Análisis Clustering
+## Lectura y preparación de datos
+
+En la tabla auxiliar *descAero* se añade una nueva columna llamada *valo*, que toma valores 0-1 para indicar si una variable es una valoración del 0 al 5. Si lo es, tomará el valor 1, sino su valor será 0. Esto facilitará la manipulación de los datos.
+
+```{r, results='hide'}
+descAero = data.frame(descAero, "valo" = c(rep(0, 4), rep(1, 14), rep(0, 3)))
+head(descAero)
+
+```
+El objetivo de este análisis es tratar de encontrar grupos de clientes con similares puntuaciones. Por esta razón solo se elegirán aquellas variables que sean una puntuación. Con esto se tratará de relacionar los clusters conseguidos con otras variables que no sean valoraciones.
+
+El primer paso es el escalado y centrado de los datos, para que su media sea 0 y su varianza 1. A pesar de que todas las variables tienen las mismas medidas, se realiza el escalado porque la varianza no es la misma para todas las variables de valoración, y de esta manera no infiere en la agrupación.
+
+```{r}
+aeroValo = aero4[, descAero$valo == 1]
+aeroValo = scale(aeroValo, center = TRUE, scale = TRUE)
+
+```
+
+
+## Medida de distancia y tendencia de agrupamiento
+
+En este caso se utiliza la distancia de manhattan porque es la más adecuada para datos numéricos y que ya han sido estandarizados, además de querer que sea robusta la medida.
+
+```{r}
+midist <- get_dist(aeroValo, stand = FALSE, method = "manhattan")
+```
+
+```{r, results='hide'}
+set.seed(1234)
+myN = c(30, 50, 70, 100)  # m
+myhopkins = NULL
+myseed = sample(1:500, 10)
+for (i in myN) {
+  for (j in myseed) {
+    tmp = get_clust_tendency(data = aeroValo, n = i, graph = FALSE, seed = j)
+    myhopkins = c(myhopkins, tmp$hopkins_stat)
+  }
+}
+summary(myhopkins)
+```
+El índice de Hopkins toma valores entre `r round(min(myhopkins), 2)` y `r round(max(myhopkins), 2)`, con una mediana de `r round(median(myhopkins), 2)`. Al ser mayor que 0.5 pero no cercano a 1 quiere decir que hay una tendencia moderada a que se formen clusters.
+
+Con esto en cuenta, se puede continuar con el análisis para observar los posibles clusters.
+
+## Elección del método
+Para conseguir decantarse por un método correcto, lo más adecuado es analizar el coeficiente de Silhouette por cluster y por observación en lugar del global.
+
+El número óptimo de clusters elegidos para cada método se ha conseguido combinando el análisis del coeficiente de Silhouette con la variabilidad intra-cluster, como se obsrva en el **Anexo 1**. Para casos donde no estaba muy claro el número de clusters, se hace uso de la librería *NbClust*, que permite obtener una conclusión válida de forma objetiva, evitando tomar una decisión sesgada.
+
+```{r, include=FALSE}
+# MÉTODO DE LA MEDIA
+res.nbclust <- NbClust(data = aeroValo, diss = midist, distance = NULL, 
+                        min.nc = 3, max.nc = 6, 
+                        method = "average", index ="all")
+
+```
+
+```{r}
+tabla <- table(res.nbclust$Best.nc[1,])
+num_clusters <- as.numeric(names(tabla)[which.max(tabla)])
+cat("Número óptimo de clusters sugerido para el método de la media:", num_clusters)
+```
+
+```{r, include=FALSE}
+res.nbclust <- NbClust(data = aeroValo, diss = midist, distance = NULL, 
+                        min.nc = 3, max.nc = 6, 
+                        method = "kmeans", index ="all") 
+
+```
+
+```{r}
+tabla <- table(res.nbclust$Best.nc[1,])
+num_clusters <- as.numeric(names(tabla)[which.max(tabla)])
+cat("Número óptimo de clusters sugerido para k-medias:", num_clusters)
+```
+
+```{r silhouette}
+# WARD
+clust1 <- hclust(midist, method = "ward.D2")
+grupos1 <- cutree(clust1, 4)
+
+# MEDIA
+clust2 <- hclust(midist, method="average")
+grupos2 = cutree(clust2, k = 3)
+
+# K-MEDIAS
+set.seed(100)
+clust3 <- kmeans(aeroValo, centers = 4, nstart = 20)
+
+# K-MEDOIDES
+clust4 <- pam(aeroValo, k = 3)
+
+
+colores = c("darkred", "navy", "plum", "mistyrose", "mediumvioletred", "coral")
+colores2 = pal_npg("nrc")(7)
+par(mfrow = c(1,4))
+plot(silhouette(grupos1, midist), col=colores, border=NA, main = "WARD")
+plot(silhouette(grupos2, midist), col=colores, border=NA, main = "MEDIA")
+plot(silhouette(clust3$cluster, midist), col=colores, border=NA, main = "K-MEDIAS")
+plot(silhouette(clust4$clustering, midist), col=colores2, border=NA, main = "K-MEDOIDES")
+```
+
+
+A la vista de los coeficientes Silhouette, el mejor resultado se obtiene con el algoritmo k-medias, al presentar menos clientes con una clasificación errónea (coeficiente negativo), por lo que se utilizará este método.
+
+
+### Análisis de perfiles medios
+
+Para complementar la información obtenida con el PCA, se observa el perfil medio de los clusters por cada una de las variables de valoración.
+
+```{r, out.width="50%"}
+misclust = factor(clust3$cluster)
+miPCA = res.pca
+mediasCluster = aggregate(aeroValo, by = list("cluster" = misclust), mean)[,-1]
+rownames(mediasCluster) = paste0("c",1:4)
+
+matplot(t(mediasCluster), type = "l", col = colores, ylab = "", xlab = "", lwd = 2,
+        lty = 1, main = "Perfil medio de los clusters", xaxt = "n")
+axis(side = 1, at = 1:ncol(aeroValo), labels = colnames(aeroValo), las = 2)
+legend("topleft", as.character(1:4), col = colores, lwd = 2, ncol = 3, bty = "n")
+```
+
+
+Con este análisis de perfiles medios se observa que en el clúster 1 se agrupan aquellas personas que puntúan positivamente InflightEntertainment, FoodDrink, BaggageHandling e InflightService pero negativamente en OnlineBooking y OnlineBoarding. Con esto se intuye que sus clientes presentan una mala valoración del proceso online previo al vuelo.
+
+El clúster 2 es el que tiene unas puntuaciones altas en la mayor parte de variables. Destacan en específico el Wifi, OnlineBoarding, InflightEntertainment y Cleanliness.
+
+Por otro lado, el clúster 3 agrupa a los clientes con insatisfacción en general con la aerolínea, en específico para aspectos relacionados con la esperiencia a bordo, como FoodDrink, SeatComfort, InflightEntertainment y Cleanliness.
+
+Por útlimo, aquellos que se encuentran en el clúster 4 se encuentran neutros a la mayoría de aspectos del vuelo, siendo relativamente mal puntuadas BaggageHandling, InflightService y OnboardService, que son aquellas variables relacionadas con el servicio por parte de la tripulación.
+
+
+### Relación con la Satisfacción y el Género
+
+En este apartado se quiere averiguar la relación de los clusters con ciertas variables categóricas. En primer lugar se observa si existen estas relaciones, y si es el caso, se analizan.
+\begingroup
+\scriptsize
+```{r}
+chisq.test(table(aero4$Gender, clust3$cluster))
+chisq.test(table(aero4$Satisfaction, clust3$cluster))
+chisq.test(table(aero4$Customer, clust3$cluster))
+```
+\endgroup
+
+
+Con ayuda de la prueba $X^2$ se concluye que no hay clústers compuestos por un tipo de cliente específico (Loyal Customer o disloyal Customer), ya que su p-valor (`r round(chisq.test(table(aero4$Customer, clust3$cluster))$p.value, 4)`) > 0.05.
+
+
+Por otro lado, sí hay evidencia de la existencia de clústers compuestos predominantemente por un género o un tipo de satisfacción específicos (p-valor < 0.05). Para observar mejor estas relaciones, se realizan las siguientes tablas de contingencia:
+\begingroup
+\scriptsize
+```{r}
+prop.table(table(aero4$Gender, clust3$cluster), margin = 2)
+prop.table(table(aero4$Satisfaction, clust3$cluster), margin = 2)
+
+```
+\endgroup
+
+Como era de esperar, las personas de los clústers 3 y 4 son las más insatisfechas con la aerolínea, al ser aquellos con peores puntuaciones en general.
+
+Otro aspecto a recalcar es que en el cluster 4 hay más mujeres que hombres.
+
+
+### Relación con la Edad
+
+Al ser la variable Edad numérica, se hace el ANOVA y el test de Tuckey.
+\begingroup
+\scriptsize
+```{r}
+mianova = aov(aero4$Age ~ misclust)
+TukeyHSD(mianova)
+```
+\endgroup
+
+Utilizando los tests anteriores se puede observar que la edad está relacionada con los clusters. Los clústers 1 y 2 tienen clientes de la misma edad, al tener un p-valor muy elevado (`r round(max(TukeyHSD(mianova)$misclust[, "p adj"]), 4)`), sin embargo esto no ocurre con los otros 2, al tener un p-valor inferior a 0.05. En particular, el cluster 4 está compuesto por pasajeros de mayor edad, como se aprecia en la tabla, al tener diferencias con otros clusters muy positivas. Lo contrario ocurre en el cluster 3 están los de menor edad. Esto lleva a concluir que la edad puede influir en las puntuaciones otorgadas a la aerolínea.
+
+
+### Relación con otras variables cuantitativas
+
+En cuanto a otras variables como Distance, DepartureDelayMin y ArrivalDelayMin, estas no están relacionadas con los clústers ya que su p-valor es elevado en todos los casos. Para observarlo de forma visual, se realiza el test para la variable DepartureDelayMin.
+\begingroup
+\scriptsize
+```{r}
+mianova = aov(aero4$DepartureDelayMin ~ misclust)
+TukeyHSD(mianova)
+```
+\endgroup
+
+Se observa que todos los p-valores son superiores a 0.05, siendo el menor `r round(min(TukeyHSD(mianova)$misclust[, "p adj"]), 4)`.
+
+
+# PLS-DA
+Ahora se realiza un PLS-DA para predecir la satisfacción final de los clientes. Se utiliza el PLS-DA en lugar de PLS por esta misma razón, ya que la variable respuesta es categórica, la satisfacción del cliente ('Satisfied' o 'neutral or dissatisfied').
+En esta sección, se dividen los datos en 2: unos datos de entrenamiento (80%) y otros de test (20%), estratificando por 'Satisfaction'.
+
+```{r, include=FALSE}
+aero5 = aero4[,-c(1,2)] #quitar las no numericas
+aero5$Satisfaction = factor(aero5$Satisfaction)
+table(aero5$Satisfaction)
+
+set.seed(100)
+
+# Dividir en entrenamiento (80%) y test (20%) estratificado por 'Satisfaction'
+trainFilas = createDataPartition(aero5$Satisfaction, p = 0.8, list = FALSE)
+
+trainDatos = aero5[trainFilas, ]
+testDatos = aero5[-trainFilas, ]
+
+Xtrain = subset(trainDatos, select = -Satisfaction)
+ytrain = trainDatos$Satisfaction
+Xtest = subset(testDatos, select = -Satisfaction)
+ytest = testDatos$Satisfaction
+```
+
+## Estimación del modelo y del número de componentes
+En este caso, se escala la matriz X en la propia función opls y se aplica una validación cruzada k-fold para estimar el número de componentes.
+```{r, include=FALSE, out.width="40%"}
+myplsda = opls(x = Xtrain, y = ytrain, predI = NA, crossvalI = 10, 
+               scaleC = "standard", fig.pdfC = "none")
+maxNC = 10 # Lo hacemos para 10 componentes máximo 
+myplsda = opls(x = Xtrain, y = ytrain, predI = maxNC, crossvalI = 10, 
+              scaleC = "standard", fig.pdfC = "none")
+```
+```{r}
+numComp = nrow(myplsda@modelDF)
+plot(1:numComp, myplsda@modelDF$`R2Y(cum)`, type = "o", pch = 16, col = "blue3",
+     lwd = 2, xlab = "Componentes", ylab = "", ylim = c(0.15, 0.35),
+     main = "PLS-DA model: Aerolínea")
+lines(1:numComp, myplsda@modelDF$`Q2(cum)`, type = "o", pch = 16, col = "red3", lwd = 2)
+abline(h = 0.5, col = "red3", lty = 2)
+legend("bottomright", c("R2Y", "Q2"), lwd = 2, col = c("blue3", "red3"), bty = "n")
+```
+
+
+Como se puede observar en el gráfico PLS-Da, el modelo estima en 3 el número óptimo de componentes. Como siempre, se genera un gráfico para optimizar el número de componentes, aunque en este caso sería más adecuado utilizar medidas específicas del error de clasificación en lugar de R2 y Q2.
+
+A partir de la tercera componente, no se observa una mejora importante en el valor de la Q2
+ y, dado que únicamente hay dos grupos, se opta por utilizar las dos primeras componentes en lugar de las 3 que recomienda la función opls. Además, como se ve en los gráficos de scores que se muestran a continuación, con dos componentes se logra discriminar relativamente bien entre satisfecho y neutrales.
+
+```{r, echo=FALSE, results='hide'}
+myplsda = opls(x = Xtrain, y = ytrain, predI = 2, crossvalI = 10, 
+               permI = 20, scaleC = "standard")
+```
+
+
+Respecto a los siguientes gráficos:
+
+- Gráfico superior derecho: pR2Y y pQ2
+- Gráfico inferior derecho: Scores PLS-DA 
+
+El gráfico de pR2Y y pQ2 evalúa si el modelo es estadísticamente significativo, los puntos grises representan los valores obtenidos al permutar aleatoriamente la variable de clase, en este caso los valores reales están claramente separados del resto, es decir, que el modelo no ha salido bien por azar. En resumen el modelo es estadísticamente signifactivo (pR2Y = 0.05, pQ2 = 0.05).
+El gráfico de Scores muestra la distribución de las observaciones en el espacio latente generado por PLS-DA.Cada punto del gráfico representa un tipo de satisfacción. Aunque hay cierta superposición, se observa una tendencia a la separación entre las clases del eje t1. El modelo consigue discriminar entre las dos clases de satisfacción. No es una separación perfecta, pero hay un patrón claro de agrupación.
+
+## Validación e interpretación del modelo
+En el gráfico inferior izquierdo, la T² de Hotelling se representa en el eje X y la SCR en el eje Y. Se observan algunas muestras (539 y 585) que sobrepasan el umbral de distancia ortogonal, indicando que están mal representadas por el modelo y podrían ser consideradas datos atípicos y por tanto se podrían excluir.
+
+```{r interprCan, message=FALSE, out.width="50%"}
+plot(x = myplsda, typeVc = "x-score",
+     parCexN = 0.8, parCompVi = c(1, 2), parPaletteVc = NA,
+     parTitleL = TRUE, parCexMetricN = NA)
+```
+
+
+A partir del gráfico de scores, se observa que el modelo logra una separación entre clientes satisfechos y no satisfechos, especialmente a lo largo de la primera componente. Por otro lado en el *Anexo 3* (Gráfico de pesos) se identifica que las variables Wifi, OnlineBoarding, InflightEntertainment, SeatComfort y FoodDrink tienen una mayor contribución a la discriminación entre clases. Estas variables tienen pesos positivos, es decir, que sus valores son más altos en los clientes satisfechos, y por tanto pueden considerarse factores clave en la satisfacción del cliente.
+
+## Medidas del error en PLS-DA
+Ahora se observan las medidas del error en los datos de entrenamiento (primero) y de test (segundo):
+\begingroup
+\scriptsize
+```{r prediDAtrain, message=FALSE, warning=FALSE}
+mypred = predict(myplsda)
+caret::confusionMatrix(mypred, ytrain, positive = "satisfied")
+
+mypred = predict(myplsda, Xtest)
+caret::confusionMatrix(mypred, ytest, positive = "satisfied")
+
+```
+\endgroup
+
+Para verifica que los datos test (Xtest) caen dentro del espacio de los datos de entrenamiento y que que las predicciones hechas con el modelo son correctas, con los datos de entrenamiento se realiza PCA y los datos del test se proyectan en el *Anexo 4* (Espacio de datos). En este caso sí que hay datos para las predicciones que no caen dentro del espacio.
+
+En el conjunto de test, el modelo obtiene una precisión general alta (85.1%) y una especificidad excelente (98.2%), lo que indica que discrimina muy bien a los clientes insatisfechos. Sin embargo, su sensibilidad es baja (44.6%), lo que significa que falla en detectar muchos de los clientes satisfechos. Esta asimetría también se refleja en una balanced accuracy de 71.4%. En conjunto, el modelo parece más conservador, priorizando evitar falsos positivos a costa de perder verdaderos positivos, lo que puede ser problemático si el objetivo es identificar perfiles de satisfacción.
+
+# ANÁLISIS DISCRIMINANTE
+```{r preparación}
+# Crear dummies solo para 'gender' y 'customer', sin intercepto
+dummies <- model.matrix(~ Gender + Customer, data = aero4)[, -1]
+
+# Unir dummies al resto del data.frame
+aero6 <- cbind(dummies, aero4)
+
+# eliminar las columnas originales si ya no se necesitan
+aero6 <- subset(aero6, select = -c(Gender, Customer))
+
+
+```
+
+La variable objetivo es Satisfaction. Veamos las proporciones:
+\begingroup
+\scriptsize
+```{r proporción}
+ttt = table(aero6$Satisfaction)
+kable(round(100*ttt/sum(ttt),2))
+```
+\endgroup
+La clase positiva ('Neutral or Dissatisfied') representa el `r round(100 * table(aero6$Satisfaction)["neutral or dissatisfied"] / sum(table(aero6$Satisfaction)), 2)`% de los casos, lo que genera un desbalance que puede afectar al modelo y requerir ajuste del punto de corte.
+Para evaluar bien la predicción, se realiza una división en train y test manteniendo esa proporción.
+
+```{r train y test, include=FALSE}
+set.seed(100) #Fijar la semilla para poder coparar y reproducir ls resultados (la división se hace aleatoriamente)
+
+aero6$Satisfaction = factor(aero6$Satisfaction) 
+trainFilas = createDataPartition(aero6$Satisfaction, p=0.8, list=FALSE)  #La función de la libreria *caret*
+
+head(trainFilas) # trainFilas contiene los números de las filas que irán a Train
+trainDatos = aero6[trainFilas,] #DATOS PARA EL TRAIN
+testDatos = aero6[-trainFilas,] #DATOS PARA EL TEST
+num = table(trainDatos$Satisfaction); print(num)
+perc = round(100*num/sum(num), 2)
+kable(cbind(num, perc))
+
+set.seed(100) 
+
+```
+
+A continuación, se diseña el procedimiento de validación cruzada k-fold, con k=10 folds, que se aplicará más adelante sobre el conjunto de entrenamiento. Se realizan 30 repeticiones de este procedimiento k-fold.
+
+```{r valid2}
+myTrainControl = trainControl(method = "repeatedcv",
+                              number = 10,  
+                              repeats = 30) 
+```
+
+
+### MODELOS DE ANÁLISIS DISCRIMINANTE
+
+Se realizan varios modelos con el objetivo de poder compararlos y elegir el más adecuado para el análisis.
+
+**LDA**
+Se realiza un modelo LDA con los datos de Train.
+\begingroup
+\scriptsize
+```{r LDA}
+modeloTR = train(Satisfaction ~ ., data = trainDatos, method='lda', trControl = myTrainControl)  
+modeloTR$results
+```
+\endgroup
+
+En los datos de entrenamiento, el coeficiente Kappa indica una mejora sustancial respecto al azar, al ser de `r round(modeloTR$results$Kappa, 4)`. La accuracy es elevada, de `r round(modeloTR$results$Accuracy, 4)`, aunque en parte debido al desbalance de clases. Para valorar mejor cómo se ha gestionado este desequilibrio, se analiza la matriz de confusión en el conjunto de test.
+
+\begingroup
+\scriptsize
+```{r, include=FALSE}
+# Datos de entrenamiento
+ajusteTR = predict(modeloTR,trainDatos, type = "raw") 
+
+cm_train=caret::confusionMatrix(ajusteTR, factor(trainDatos$Satisfaction), positive = "neutral or dissatisfied")  #Accuracy,  sensibilidad, especifidad, kappa...
+#Para mostrar lo más importante:
+
+
+cm_train$table
+#Las métricas interesantes ya salen arriba
+# metricas_train = data.frame(
+#   Accuracy = cm_train$overall["Accuracy"],
+#   Kappa = cm_train$overall["Kappa"],
+#   Sensibilidad = cm_train$byClass["Sensitivity"],
+#   Especificidad = cm_train$byClass["Specificity"],
+#   BalancedAccuracy = cm_train$byClass["Balanced Accuracy"]
+# )
+# round(metricas_train, 3)
+
+```
+
+```{r results = TRUE}
+ajusteTest = predict(modeloTR, testDatos, type = "raw")
+cm_test = confusionMatrix(ajusteTest, factor(testDatos$Satisfaction),
+                          positive = "neutral or dissatisfied")
+
+# Mostrar solo la tabla 
+cm_test$table
+
+metricas_test = data.frame(
+  Accuracy = cm_test$overall["Accuracy"],
+  Kappa = cm_test$overall["Kappa"],
+  Sensibilidad = cm_test$byClass["Sensitivity"],
+  Especificidad = cm_test$byClass["Specificity"],
+  BalancedAccuracy = cm_test$byClass["Balanced Accuracy"]
+)
+
+# Mostrar redondeado
+round(metricas_test, 3)
+
+```
+\endgroup
+
+El modelo LDA presenta un comportamiento similar en train y test, con una sensibilidad muy alta (`r round(metricas_test$Sensibilidad, 3)` para test) y una especificidad que mejora en test (`r round(metricas_test$Especificidad, 3)`). El aumento del Kappa también sugiere buena generalización pese al desbalance (`r round(metricas_test$Kappa, 3)`). En conjunto, ofrece un rendimiento sólido y equilibrado.
+
+
+**QDA**
+
+Se realiza ahora un modelo con el método QDA, con el mismo proceso que el LDA.
+
+```{r modeloQDA}
+modeloQDA = train(Satisfaction ~ ., 
+                  data = trainDatos, 
+                  method = "qda", 
+                  trControl = myTrainControl)
+```
+
+```{r QDA cm train, include=FALSE}
+ajusteQDA_train = predict(modeloQDA, trainDatos[, -21],type = "raw")
+
+cm_train=confusionMatrix(ajusteQDA_train, trainDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar solo la tabla 
+cm_train$table
+
+metricas_train = data.frame(
+  Accuracy = cm_train$overall["Accuracy"],
+  Kappa = cm_train$overall["Kappa"],
+  Sensibilidad = cm_train$byClass["Sensitivity"],
+  Especificidad = cm_train$byClass["Specificity"],
+  BalancedAccuracy = cm_train$byClass["Balanced Accuracy"]
+)
+
+# Mostrar redondeado
+round(metricas_train, 3)
+
+```
+
+Con los datos de test:
+\begingroup
+\scriptsize
+```{r QDA cm test, results=TRUE}
+ajusteQDA_test = predict(modeloQDA, newdata = testDatos[,-21], type = "raw")
+cm_test = confusionMatrix(ajusteQDA_test, testDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar solo la tabla 
+cm_test$table
+
+metricas_test = data.frame(
+  Accuracy = cm_test$overall["Accuracy"],
+  Kappa = cm_test$overall["Kappa"],
+  Sensibilidad = cm_test$byClass["Sensitivity"],
+  Especificidad = cm_test$byClass["Specificity"],
+  BalancedAccuracy = cm_test$byClass["Balanced Accuracy"]
+)
+
+# Mostrar redondeado
+round(metricas_test, 3)
+
+```
+\endgroup
+
+El modelo QDA muestra un rendimiento estable tanto en train (**Anexo 7**) como en test, con una sensibilidad alta (superior al 85%) y una especificidad razonable. Las métricas de Kappa y balanced accuracy indican que generaliza bien sin sobreajuste. En conjunto, se comporta de forma equilibrada y fiable.
+
+
+**GLM**
+
+Ahora se prueba con el método de la regresión logística binaria. Se comienza con un punto de corte de 0'25, por el desequilibrio de clases. En la curva ROC se observa mejor cuál puede ser su punto de corte adecuado, si resulta ser buen modelo.
+```{r relog}
+modeloTrRL = glm(Satisfaction ~ ., data = trainDatos, family = "binomial")
+```
+
+
+```{r cm relog train, include=FALSE}
+# Obtener probabilidades para train
+ajusteTrainProb = predict(modeloTrRL, newdata = trainDatos, type = "response")
+
+# Punto de corte por defecto va a ser 0.25, por el desquilibrio de las clases.
+predTrain = ifelse(ajusteTrainProb > 0.25, "neutral or dissatisfied", "satisfied")
+predTrain = factor(predTrain, levels = levels(trainDatos$Satisfaction))
+
+
+cm_train = caret::confusionMatrix(predTrain, trainDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar tabla
+cm_train$table
+
+# Extraer métricas
+metricas_train = data.frame(
+  Accuracy = cm_train$overall["Accuracy"],
+  Kappa = cm_train$overall["Kappa"],
+  Sensibilidad = cm_train$byClass["Sensitivity"],
+  Especificidad = cm_train$byClass["Specificity"],
+  BalancedAccuracy = cm_train$byClass["Balanced Accuracy"]
+)
+
+round(metricas_train, 3)
+
+```
+
+Para test:
+\begingroup
+\scriptsize
+```{r cm relog test, results=TRUE}
+# Obtener probabilidades para test
+ajusteTestProb = predict(modeloTrRL, newdata = testDatos, type = "response")
+
+# Clasificar con punto de corte 0.25
+predTest = ifelse(ajusteTestProb > 0.25, "neutral or dissatisfied", "satisfied")
+predTest = factor(predTest, levels = levels(testDatos$Satisfaction))
+
+# Matriz de confusión y métricas
+cm_test = caret::confusionMatrix(predTest, testDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar matriz
+cm_test$table
+
+# Extraer métricas
+metricas_test = data.frame(
+  Accuracy = cm_test$overall["Accuracy"],
+  Kappa = cm_test$overall["Kappa"],
+  Sensibilidad = cm_test$byClass["Sensitivity"],
+  Especificidad = cm_test$byClass["Specificity"],
+  BalancedAccuracy = cm_test$byClass["Balanced Accuracy"]
+)
+
+round(metricas_test, 3)
+
+```
+\endgroup
+
+El modelo de regresión logística binaria tiene un rendimiento muy pobre tanto en train como en test. La accuracy no supera el 25% y el Kappa es negativo, lo que indica que el modelo está clasificando peor que el azar. La sensibilidad y la especificidad son bajas, y la balanced accuracy apenas llega al 21% en los de entrenamiento (**Anexo 6**), y es incluso menor en el caso de train. Está claro que este modelo no está captando bien el patrón de los datos en este caso. Puede deberse al punto de corte, por lo que se revisrá en la curva ROC.
+
+Además, podría deberse también a la multicolinealidad. Veamos si hay variables correlacionadas:
+
+```{r corre, warning=FALSE, message=FALSE, out.width="70%"}
+corrplot(cor(trainDatos[,-21]), method = "ellipse", diag = FALSE, order = "hclust",
+         hclust.method = "ward.D2", tl.col = 1, tl.cex = 0.8)
+```
+
+Hay algunos grupos de variables bastate correlacionadas entre sí. Se prueba a eliminar algunas variables de estos grupos para ver si la multicolinealidad puede estar empeorando el modelo.
+Se realiza un modelo sin DepartureDelayMin (muy relacionada con ArrivalDelayMin), Wifi (con OnlineBoarding), y Cleanliness (con otras 3 variables).
+
+```{r relog sin variables}
+modelo_glm1=glm(formula = Satisfaction ~ . - DepartureDelayMin - Wifi - 
+    Cleanliness, family = "binomial", data = trainDatos)
+```
+Para el train:
+\begingroup
+\scriptsize
+```{r cm relog1 train}
+# Probabilidades en train
+prob_train = predict(modelo_glm1, newdata = trainDatos, type = "response")
+
+# Clasificación
+pred_train = factor(ifelse(prob_train > 0.75, "neutral or dissatisfied", "satisfied"),
+                    levels = levels(trainDatos$Satisfaction))
+
+# Matriz y métricas
+conf_train = confusionMatrix(pred_train, trainDatos$Satisfaction,
+                             positive = "neutral or dissatisfied")
+
+# Mostrar matriz
+conf_train$table
+
+# Métricas
+metricas_train = data.frame(
+  Accuracy = conf_train$overall["Accuracy"],
+  Kappa = conf_train$overall["Kappa"],
+  Sensibilidad = conf_train$byClass["Sensitivity"],
+  Especificidad = conf_train$byClass["Specificity"],
+  BalancedAccuracy = conf_train$byClass["Balanced Accuracy"]
+)
+
+round(metricas_train, 3)
+
+```
+\endgroup
+
+Para el test:
+\begingroup
+\scriptsize
+```{r cm glm1}
+# Probabilidades en test
+prob_test = predict(modelo_glm1, newdata = testDatos, type = "response")
+
+# Clasificación (puedes ajustar el punto de corte si quieres)
+pred_test = factor(ifelse(prob_test > 0.75, "neutral or dissatisfied", "satisfied"),
+                   levels = levels(testDatos$Satisfaction))
+
+# Matriz y métricas
+conf_test = confusionMatrix(pred_test, testDatos$Satisfaction,
+                            positive = "neutral or dissatisfied")
+
+# Mostrar matriz
+conf_test$table
+
+# Métricas
+metricas_test = data.frame(
+  Accuracy = conf_test$overall["Accuracy"],
+  Kappa = conf_test$overall["Kappa"],
+  Sensibilidad = conf_test$byClass["Sensitivity"],
+  Especificidad = conf_test$byClass["Specificity"],
+  BalancedAccuracy = conf_test$byClass["Balanced Accuracy"]
+)
+
+round(metricas_test, 3)
+
+```
+\endgroup
+Este modelo sí que  consigue una leve mejora frente al modelo completo, pero sigue siendo prácticamente igual que el azar. Cómo podía deberse al punto de corte, se decide inspeccionar la curva ROC.
+
+## Comparación de modelos
+En este apartado se comparan los 3 modelos realizados con la curva ROC. 
+
+```{r}
+
+
+
+
+prob_glm  = predict(modelo_glm1, newdata = testDatos, type = "response")
+prob_qda  = predict(modeloQDA, newdata = testDatos, type = "prob")[, "neutral or dissatisfied"]
+prob_lda  = predict(modeloTR, newdata = testDatos, type = "prob")[, "neutral or dissatisfied"]
+
+
+roc_glm = roc(testDatos$Satisfaction ~ prob_glm,
+              levels = rev(levels(testDatos$Satisfaction)),
+              plot = TRUE, col = "red3", print.auc = FALSE, lwd = 2)
+
+roc_qda = roc(testDatos$Satisfaction ~ prob_qda,
+              levels = rev(levels(testDatos$Satisfaction)),
+              plot = TRUE, add = TRUE, col = "blue3", lwd = 2, lty = 2)
+
+roc_lda = roc(testDatos$Satisfaction ~ prob_lda,
+              levels = rev(levels(testDatos$Satisfaction)),
+              plot = TRUE, add = TRUE, col = "darkgreen", lwd = 2, lty = 3)
+
+
+legend("bottomright",
+       legend = c(
+         paste0("GLM - AUC = ", round(roc_glm$auc, 4)),
+         paste0("QDA - AUC = ", round(roc_qda$auc, 4)),
+         paste0("LDA - AUC = ", round(roc_lda$auc, 4))
+       ),
+       col = c("red3", "blue3", "darkgreen"),
+       lwd = 2, lty = c(1,2,3), bty = "n")
+
+```
+
+Según la curva ROC, el modelo QDA tiene el mayor AUC, aunque los tres modelos son aceptables y el GLM es el menos eficaz. Sin embargo, LDA ofrece mejores resultados en sensibilidades altas, lo que puede ser prioritario para la aerolínea si quiere identificar mejor a los clientes insatisfechos. Por ello, se selecciona LDA como modelo final y se procede a optimizar su punto de corte.
+
+
+## Encontrar el punto de corte óptimo
+
+```{r}
+modeloTR = train(Satisfaction ~ ., data = trainDatos, method='lda', trControl = myTrainControl)
+probTest = predict(modeloTR, newdata = testDatos[,-21], type = "prob")
+
+```
+\begingroup
+\scriptsize
+```{r cutoffs LDA, result = TRUE}
+cutoffs = seq(0.3, 0.8, by = 0.1)
+sens = c()
+spec = c()
+balAcc = c()
+kappa = c()
+
+for (c in cutoffs) {
+  pred = ifelse(probTest[, "neutral or dissatisfied"] > c, 
+                "neutral or dissatisfied", "satisfied")
+  pred = factor(pred, levels = levels(testDatos$Satisfaction))
+  
+  cm = confusionMatrix(pred, testDatos$Satisfaction, positive = "neutral or dissatisfied")
+  
+  sens = c(sens, cm$byClass["Sensitivity"])
+  spec = c(spec, cm$byClass["Specificity"])
+  balAcc = c(balAcc, cm$byClass["Balanced Accuracy"])
+  kappa = c(kappa, as.numeric(cm$overall["Kappa"]))  # <- aquí el cambio
+}
+
+resultados = data.frame(
+  `Punto de corte` = cutoffs,
+  Sensibilidad = round(sens, 3),
+  Especificidad = round(spec, 3),
+  `Balanced Accuracy` = round(balAcc, 3),
+  Kappa = round(kappa, 3)
+)
+
+print(resultados)
+
+
+```
+\endgroup
+
+Tras probar distintos puntos de corte, el valor 0.5 ofrece el mejor equilibrio general en las métricas. Si se quisiera priorizar la especificidad y reducir falsos positivos, se podría elevar el umbral a 0.6 o 0.7, según las prioridades de la compañía. En este caso, se opta por continuar con un punto de corte de 0.5 para el modelo final.
+\begingroup
+\scriptsize
+```{r Matrix LDA 0.5, results=TRUE}
+pred_final = ifelse(probTest[, "neutral or dissatisfied"] > 0.5,
+                    "neutral or dissatisfied", "satisfied")
+
+pred_final = factor(pred_final, levels = levels(testDatos$Satisfaction))
+
+cm_final=confusionMatrix(pred_final, testDatos$Satisfaction, positive = "neutral or dissatisfied")
+# Mostrar matriz
+cm_final$table
+
+# Métricas
+metricas_test = data.frame(
+  Accuracy = cm_final$overall["Accuracy"],
+  Kappa = cm_final$overall["Kappa"],
+  Sensibilidad = cm_final$byClass["Sensitivity"],
+  Especificidad = cm_final$byClass["Specificity"],
+  BalancedAccuracy = cm_final$byClass["Balanced Accuracy"]
+)
+
+round(metricas_test, 3)
+
+```
+\endgroup
+
+
+El modelo LDA con punto de corte 0.5 da muy buenos resultados en test. La sensibilidad es altísima (`r round(metricas_test$Sensibilidad, 3)`), lo que significa que detecta casi todos los clientes insatisfechos, que además son mayoría. La especificidad no es perfecta, pero es decente (`r round(metricas_test$Especificidad, 3)`), y eso hace que la balanced accuracy se mantenga alta (`r round(metricas_test$BalancedAccuracy, 3)`). El índice Kappa también es sólido (`r round(metricas_test$Kappa, 3)`), indicando un buen acuerdo más allá del azar. En conjunto, el modelo es preciso, equilibrado y generaliza bien.
+
+
+## Efecto de las variables
+
+Se procede ahora a ver cómo de importantes son las variables para el modelo, que efecto tienen. El siguiente gráfico muestra las 15 variables con mayor coeficiente en valor absoluto. 
+```{r, include=FALSE}
+# Coeficientes ordenados
+importancia_vars = modeloTR$finalModel$scaling
+importancia_ordenada = importancia_vars[order(abs(importancia_vars[,1]), decreasing = TRUE), , drop = FALSE]
+
+# Mostrar los más importantes
+print(round(importancia_ordenada, 3))
+```
+
+```{r, results=TRUE, out.width="50%"}
+
+n = 10 #Hay 20 variables, si se quiere enseñar menos, se puede bajar el número
+
+# Convertir a data.frame
+df_importancia = data.frame(Variable = rownames(importancia_ordenada),
+                            Coeficiente = importancia_ordenada[,1])
+
+# Filtrar las n más importantes
+df_top_n = head(df_importancia[order(abs(df_importancia$Coeficiente), decreasing = TRUE), ], n)
+
+# Gráfico
+ggplot(df_top_n, aes(x = reorder(Variable, abs(Coeficiente)), y = Coeficiente)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = paste("Top", n, "variables más importantes en LDA"),
+       x = "Variable", y = "Coeficiente discriminante") +
+  theme_minimal()
+
+```
+
+Las variables que más separan a los clientes satisfechos de los insatisfechos son la fidelidad y la calidad del Wifi. También influyen, aunque menos, el entretenimiento a bordo y la facilidad para hacer el check-in online (con efecto negativo). Por el contrario, factores como la el confort de los asientos, y la comida y bebida a bordo aportan poca información. En resumen, la satisfacción se explica sobre todo por la calidad del servicio digital y la relación con el cliente.
+
+***Conclusiones***
+Se han probado varios modelos supervisados: regresión logística, QDA y LDA. Aunque QDA obtuvo el mayor AUC, el modelo LDA fue el seleccionado por su rendimiento más estable y equilibrado, con buena precisión y un Kappa claramente superior al azar. Además, se compararon los modelos con curvas ROC y se analizaron los coeficientes del LDA. Las variables más influyentes resultaron ser la fidelidad del cliente y la calidad del Wifi, mientras que factores como edad, retrasos o distancia apenas aportaron discriminación.
+
+En conjunto, el modelo LDA ofrece buenas predicciones y aporta claridad sobre qué aspectos del servicio influyen más en la satisfacción, lo que puede guiar mejoras prácticas.
+
+
+
+
+
+\newpage
+# ANEXOS
+## ANEXO 1
+```{r}
+par(mfrow = c(1, 3))
+boxplot(data.frame(missing = aero2$LegRoom, imputed = aero3$LegRoom),
+        main = "LegRoom", col = c("lightgrey", "indianred"))
+
+boxplot(data.frame(missing = aero2$BaggageHandling, imputed = aero3$BaggageHandling),
+        main = "BaggageHandling", col = c("lightgrey", "indianred"))
+
+boxplot(data.frame(missing = aero2$Checkin, imputed = aero3$Checkin),
+        main = "Checkin", col = c("lightgrey", "indianred"))
+```
+
+```{r, fig.width=6}
+boxplot(aero3$ArrivalDelayMin, col = "mistyrose", main = "Después")
+boxplot(aero2$ArrivalDelayMin, col = "firebrick", main = "Antes")
+```
+
+
+## ANEXO 2
+```{r}
+# MÉTODO DE WARD
+
+p1 = fviz_nbclust(x = aeroValo, FUNcluster = hcut, method = "silhouette", 
+                  hc_method = "ward.D2", k.max = 10, verbose = FALSE, 
+                  hc_metric = "euclidean") + labs(title = "Num. optimo clusters WARD")
+
+p2 = fviz_nbclust(x = aeroValo, FUNcluster = hcut, method = "wss", 
+                  hc_method = "ward.D2", k.max = 10, verbose = FALSE, 
+                  hc_metric = "euclidean") + labs(title = "Num. optimo clusters WARD")
+grid.arrange(p1, p2, nrow = 1)
+
+```
+
+```{r}
+# MÉTODO DE LA MEDIA
+p1 = fviz_nbclust(x = aeroValo, FUNcluster = hcut, method = "silhouette", 
+                  hc_method = "average", k.max = 10, verbose = FALSE, 
+                  hc_metric = "euclidean") + labs(title = "Num. optimo clusters Media")
+p2 = fviz_nbclust(x = aeroValo, FUNcluster = hcut, method = "wss", 
+                  hc_method = "average", k.max = 10, verbose = FALSE, 
+                  hc_metric = "euclidean") + labs(title = "Num. optimo clusters Media")
+grid.arrange(p1, p2, nrow = 1)
+```
+
+```{r}
+# MÉTODO DE K-MEDIAS
+p1 = fviz_nbclust(x = aeroValo, FUNcluster = kmeans, method = "silhouette", 
+             k.max = 10, verbose = FALSE) +
+  labs(title = "K-means")
+p2 = fviz_nbclust(x = aeroValo, FUNcluster = kmeans, method = "wss", 
+             k.max = 10, verbose = FALSE) +
+  labs(title = "K-means")
+grid.arrange(p1, p2, nrow = 1)
+```
+
+```{r koptPam}
+# MÉTODO DE K-MEDOIDES
+p1 = fviz_nbclust(x = aeroValo, FUNcluster = pam, method = "silhouette", 
+             k.max = 10, verbose = FALSE) +
+  labs(title = "Numero de clusters k-medoides")
+p2 = fviz_nbclust(x = aeroValo, FUNcluster = pam, method = "wss", 
+             k.max = 10, verbose = FALSE) +
+  labs(title = "Numero de clusters k-medoides")
+grid.arrange(p1, p2, nrow = 1)
+
+```
+
+
+## ANEXO 3
+```{r interprCan2, message=FALSE}
+plot(x = myplsda, typeVc = "xy-weight",
+     parCexN = 0.7, parCompVi = c(1, 2), parPaletteVc = NA, 
+     parTitleL = TRUE, parCexMetricN = NA)
+```
+
+
+## ANEXO 4
+```{r}
+pca_train <- prcomp(Xtrain, center = TRUE, scale. = TRUE)
+test_pca <- predict(pca_train, newdata = Xtest)
+plot(pca_train$x[, 1], pca_train$x[, 2], col = "grey", pch = 16, xlab = "PC1", ylab = "PC2", main = "Espacio datos")
+points(test_pca[, 1], test_pca[, 2], col = "purple", pch = 4) 
+legend("topright", legend = c("Train", "Test"), col = c("grey", "purple"), pch = c(16, 4))
+```
+
+
+## ANEXO 5
+```{r}
+ajusteQDA_train = predict(modeloQDA, trainDatos[, -21],type = "raw")
+
+cm_train=confusionMatrix(ajusteQDA_train, trainDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar solo la tabla 
+cm_train$table
+
+metricas_train = data.frame(
+  Accuracy = cm_train$overall["Accuracy"],
+  Kappa = cm_train$overall["Kappa"],
+  Sensibilidad = cm_train$byClass["Sensitivity"],
+  Especificidad = cm_train$byClass["Specificity"],
+  BalancedAccuracy = cm_train$byClass["Balanced Accuracy"]
+)
+
+# Mostrar redondeado
+round(metricas_train, 3)
+
+```
+
+
+## ANEXO 6
+```{r}
+# Obtener probabilidades para train
+ajusteTrainProb = predict(modeloTrRL, newdata = trainDatos, type = "response")
+
+# Punto de corte por defecto va a ser 0.25, por el desquilibrio de las clases.
+predTrain = ifelse(ajusteTrainProb > 0.25, "neutral or dissatisfied", "satisfied")
+predTrain = factor(predTrain, levels = levels(trainDatos$Satisfaction))
+
+
+cm_train = caret::confusionMatrix(predTrain, trainDatos$Satisfaction, positive = "neutral or dissatisfied")
+
+# Mostrar tabla
+cm_train$table
+
+# Extraer métricas
+metricas_train = data.frame(
+  Accuracy = cm_train$overall["Accuracy"],
+  Kappa = cm_train$overall["Kappa"],
+  Sensibilidad = cm_train$byClass["Sensitivity"],
+  Especificidad = cm_train$byClass["Specificity"],
+  BalancedAccuracy = cm_train$byClass["Balanced Accuracy"]
+)
+
+round(metricas_train, 3)
+
+```
+
+## ANEXO 7
+Para los datos de test:
+```{r, results = TRUE}
+ajusteTest = predict(modeloTR, testDatos, type = "raw")
+cm_test = confusionMatrix(ajusteTest, factor(testDatos$Satisfaction),
+                          positive = "neutral or dissatisfied")
+
+# Mostrar solo la tabla 
+cm_test$table
+
+metricas_test = data.frame(
+  Accuracy = cm_test$overall["Accuracy"],
+  Kappa = cm_test$overall["Kappa"],
+  Sensibilidad = cm_test$byClass["Sensitivity"],
+  Especificidad = cm_test$byClass["Specificity"],
+  BalancedAccuracy = cm_test$byClass["Balanced Accuracy"]
+)
+
+# Mostrar redondeado
+round(metricas_test, 3)
+
+```
